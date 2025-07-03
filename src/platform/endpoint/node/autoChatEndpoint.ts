@@ -7,6 +7,7 @@ import { ChatMessage } from '@vscode/prompt-tsx/dist/base/output/rawTypes';
 import type { CancellationToken } from 'vscode';
 import { ITokenizer, TokenizerType } from '../../../util/common/tokenizer';
 import { AsyncIterableObject } from '../../../util/vs/base/common/async';
+import { Emitter } from '../../../util/vs/base/common/event';
 import { IntentParams, Source } from '../../chat/common/chatMLFetcher';
 import { ChatLocation, ChatResponse } from '../../chat/common/commonTypes';
 import { ILogService } from '../../log/common/logService';
@@ -27,6 +28,11 @@ import { IEndpointProvider } from '../common/endpointProvider';
  */
 export class AutoChatEndpoint implements IChatEndpoint {
 	public static readonly id = 'auto';
+	private static _lastSelectedModelName: string = '';
+	private static _onModelSelectionChanged = new Emitter<string>();
+	private static _selectedModelName: string = '';
+	private static _lastActualModelName: string = '';
+
 	maxOutputTokens: number = 4096;
 	model: string = AutoChatEndpoint.id;
 	supportsToolCalls: boolean = true;
@@ -41,10 +47,43 @@ export class AutoChatEndpoint implements IChatEndpoint {
 	policy: 'enabled' | { terms: string } = 'enabled';
 	urlOrRequestMetadata: string = '';
 	modelMaxPromptTokens: number = 64000;
-	name: string = 'Auto';
 	version: string = 'auto';
 	family: string = 'auto';
 	tokenizer: TokenizerType = TokenizerType.O200K;
+
+	// Dynamic name based on last selected model
+	get name(): string {
+		return AutoChatEndpoint._selectedModelName || 'Auto';
+	}
+
+	// Static methods to manage the selected model display
+	/**
+	 * Updates the selected model name for the Auto endpoint display
+	 * @param modelName The friendly name of the model that was selected
+	 */
+	public static updateSelectedModel(modelName: string): void {
+		const newName = `Auto (${modelName})`;
+		if (AutoChatEndpoint._selectedModelName !== newName) {
+			AutoChatEndpoint._selectedModelName = newName;
+			AutoChatEndpoint._lastActualModelName = modelName;
+			AutoChatEndpoint._onModelSelectionChanged.fire(modelName);
+		}
+	}
+
+	/**
+	 * Gets the last selected model name for display purposes
+	 * @returns The friendly name of the last selected model
+	 */
+	public static getLastSelectedModelName(): string {
+		return AutoChatEndpoint._lastActualModelName || 'Auto';
+	}
+
+	/**
+	 * Event fired when the Auto model selection changes
+	 */
+	public static get onModelSelectionChanged() {
+		return AutoChatEndpoint._onModelSelectionChanged.event;
+	}
 
 	constructor(
 		@IEndpointProvider private readonly _endpointProvider: IEndpointProvider,
@@ -92,12 +131,15 @@ export class AutoChatEndpoint implements IChatEndpoint {
  * @returns True if the auto mode is enabled, false otherwise
  */
 export function isAutoModeEnabled(expService: IExperimentationService): boolean {
-	return !!expService.getTreatmentVariable<string>('vscode', 'copilotchatautomodel');
+	// Always enable intelligent auto mode
+	return true;
 }
 
 /**
- * Resolves the auto chat endpoint to hte backing chat endpoint.
+ * Resolves the auto chat endpoint to the most suitable backing chat endpoint based on intelligent prompt analysis.
  * @param endpointProvider The endpoint provider to use to get the chat endpoints
+ * @param expService The experimentation service (not used in intelligent mode)
+ * @param userPrompt The user's prompt to analyze for optimal model selection
  * @returns The endpoint that should be used for the auto chat model
  */
 export async function resolveAutoChatEndpoint(
@@ -105,7 +147,76 @@ export async function resolveAutoChatEndpoint(
 	expService: IExperimentationService,
 	userPrompt: string | undefined,
 ): Promise<IChatEndpoint> {
-	const modelId = expService.getTreatmentVariable<string>('vscode', 'copilotchatautomodel');
-	const endpoint = (await endpointProvider.getAllChatEndpoints()).find(e => e.model === modelId) || await endpointProvider.getChatEndpoint('copilot-base');
-	return endpoint;
+	const allEndpoints = await endpointProvider.getAllChatEndpoints();
+
+	// If no prompt provided, default to GPT-4o or GPT-4.1
+	if (!userPrompt || userPrompt.trim().length === 0) {
+		const defaultEndpoint = allEndpoints.find(e => e.model === 'gpt-4o') ||
+			allEndpoints.find(e => e.model === 'gpt-4.1') ||
+			allEndpoints.find(e => e.model === 'gpt-4') ||
+			await endpointProvider.getChatEndpoint('copilot-base');
+		// Update the Auto display name to show the default model
+		AutoChatEndpoint.updateSelectedModel(defaultEndpoint.name);
+		return defaultEndpoint;
+	}
+
+	// Analyze prompt for intelligent model selection
+	const promptLower = userPrompt.toLowerCase();
+
+	// Task type detection patterns
+	const isComplexReasoning = /\b(analy[sz]e|reasoning|logic|problem[\s-]solving|strategy|architecture|design pattern|trade[\s-]off|pros and cons|compare|evaluate|assessment|complex|difficult|challenging)\b/.test(promptLower);
+	const isCodeGeneration = /\b(generat|creat|writ|build|implement|develop|code|function|class|component|api|endpoint|algorithm|snippet|example)\b/.test(promptLower);
+	const isCodeReview = /\b(review|check|improv|optimi[sz]e|refactor|fix|debug|error|bug|issue|problem|suggestion|feedback|critique)\b/.test(promptLower);
+	const isCreativeWriting = /\b(story|creative|poem|article|blog|content|marketing|writing|narrative|fiction|essay|novel)\b/.test(promptLower);
+	const isVisionTask = /\b(image|photo|picture|visual|diagram|chart|screenshot|analysis)\b/.test(promptLower);
+	const isLongContext = userPrompt.length > 8000; // Long prompts need high-context models
+
+	console.log(`[AutoChatEndpoint] Prompt analysis: complex=${isComplexReasoning}, code=${isCodeGeneration}, review=${isCodeReview}, creative=${isCreativeWriting}, vision=${isVisionTask}, long=${isLongContext}`);
+
+	let preferredModels: string[] = [];
+
+	// Model selection logic based on task type
+	if (isComplexReasoning) {
+		preferredModels = ['o1', 'o1-mini', 'gpt-4', 'gpt-4o', 'claude-sonnet-4'];
+	} else if (isCodeGeneration) {
+		preferredModels = ['claude-sonnet-4', 'claude-sonnet-3.7', 'gpt-4o', 'gpt-4'];
+	} else if (isCodeReview) {
+		preferredModels = ['gpt-4', 'gpt-4o', 'claude-sonnet-4'];
+	} else if (isCreativeWriting) {
+		preferredModels = ['claude-sonnet-4', 'claude-sonnet-3.7', 'claude-sonnet-3.5'];
+	} else if (isVisionTask) {
+		// Filter to vision-capable models
+		const visionModels = allEndpoints.filter(e => e.supportsVision).map(e => e.model);
+		preferredModels = visionModels.length > 0 ? visionModels : ['gpt-4o', 'claude-sonnet-4'];
+	} else if (isLongContext) {
+		// Filter to high-context models (>32k tokens)
+		const highContextModels = allEndpoints.filter(e => e.modelMaxPromptTokens > 32000).map(e => e.model);
+		preferredModels = highContextModels.length > 0 ? highContextModels : ['gpt-4o', 'claude-sonnet-4'];
+	} else {
+		// Default case - general queries
+		preferredModels = ['gpt-4o', 'gpt-4.1', 'gpt-4'];
+	}
+
+	// Find the first available preferred model
+	for (const modelId of preferredModels) {
+		const endpoint = allEndpoints.find(e => e.model === modelId || e.model === `copilot-${modelId}`);
+		if (endpoint) {
+			console.log(`[AutoChatEndpoint] Selected model: ${endpoint.model} for task type analysis`);
+			// Update the Auto display name to show the selected model
+			AutoChatEndpoint.updateSelectedModel(endpoint.name);
+			return endpoint;
+		}
+	}
+
+	// Fallback to default models (GPT-4o > GPT-4.1 > GPT-4 > copilot-base)
+	console.log(`[AutoChatEndpoint] No preferred models found, using fallback`);
+	const fallbackEndpoint = allEndpoints.find(e => e.model === 'gpt-4o') ||
+		allEndpoints.find(e => e.model === 'gpt-4.1') ||
+		allEndpoints.find(e => e.model === 'gpt-4') ||
+		await endpointProvider.getChatEndpoint('copilot-base');
+
+	console.log(`[AutoChatEndpoint] Final selected model: ${fallbackEndpoint.model}`);
+	// Update the Auto display name to show the fallback model
+	AutoChatEndpoint.updateSelectedModel(fallbackEndpoint.name);
+	return fallbackEndpoint;
 }

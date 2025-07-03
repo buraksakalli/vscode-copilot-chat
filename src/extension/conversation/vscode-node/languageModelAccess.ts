@@ -14,7 +14,7 @@ import { getTextPart } from '../../../platform/chat/common/globalStringUtils';
 import { CHAT_MODEL } from '../../../platform/configuration/common/configurationService';
 import { EmbeddingType, getWellKnownEmbeddingTypeInfo, IEmbeddingsComputer } from '../../../platform/embeddings/common/embeddingsComputer';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
-import { AutoChatEndpoint, isAutoModeEnabled } from '../../../platform/endpoint/node/autoChatEndpoint';
+import { AutoChatEndpoint, isAutoModeEnabled, resolveAutoChatEndpoint } from '../../../platform/endpoint/node/autoChatEndpoint';
 import { IEnvService } from '../../../platform/env/common/envService';
 import { IVSCodeExtensionContext } from '../../../platform/extContext/common/extensionContext';
 import { ILogService } from '../../../platform/log/common/logService';
@@ -114,9 +114,15 @@ export class LanguageModelAccess implements IExtensionContribution {
 
 					const current = currentInfo.get(endpoint.model);
 					if (current) {
-						// trust uniqueness of model ids and skip if we already have this model
-						newInfo.set(endpoint.model, current);
-						continue;
+						// For Auto endpoint, always re-register to pick up name changes
+						// For other endpoints, trust uniqueness of model ids and skip if we already have this model
+						if (endpoint.model !== AutoChatEndpoint.id) {
+							newInfo.set(endpoint.model, current);
+							continue;
+						} else {
+							// Dispose the old Auto endpoint registration so we can re-register with updated name
+							current.dispo.dispose();
+						}
 					}
 					let modelDescription: string | undefined;
 					// Remove (Preview) from the model name
@@ -150,7 +156,7 @@ export class LanguageModelAccess implements IExtensionContribution {
 						cost: endpoint.multiplier !== undefined && endpoint.multiplier !== 0 ? `${endpoint.multiplier}x` : endpoint.multiplier === 0 ? localize('languageModel.costIncluded', 'Included') : undefined,
 						category: modelCategory,
 						family: endpoint.family,
-						version: endpoint.version,
+						version: endpoint.model === AutoChatEndpoint.id ? `auto-${Date.now()}` : endpoint.version,
 						maxInputTokens: endpoint.modelMaxPromptTokens - baseCount - BaseTokensPerCompletion,
 						maxOutputTokens: endpoint.maxOutputTokens,
 						auth: session && { label: session.account.label },
@@ -206,6 +212,15 @@ export class LanguageModelAccess implements IExtensionContribution {
 		let updateTimeout: NodeJS.Timeout | undefined;
 		updateChatLanguageModelsWithQueue();
 		this._store.add(this._authenticationService.onDidAuthenticationChange(updateChatLanguageModelsWithQueue));
+
+		// Listen for Auto model selection changes and trigger re-registration
+		this._store.add(AutoChatEndpoint.onModelSelectionChanged(() => {
+			// Delay slightly to ensure the Auto endpoint name getter has updated
+			setTimeout(() => {
+				console.log('[LanguageModelAccess] Auto model selection changed, triggering re-registration');
+				updateChatLanguageModelsWithQueue();
+			}, 50);
+		}));
 
 		this._store.add(toDisposable(() => {
 
@@ -290,7 +305,8 @@ export class CopilotLanguageModelWrapper extends Disposable implements vscode.Ch
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
 		@ILogService private readonly _logService: ILogService,
 		@IAuthenticationService private readonly _authenticationService: IAuthenticationService,
-		@IEnvService private readonly _envService: IEnvService
+		@IEnvService private readonly _envService: IEnvService,
+		@IEndpointProvider private readonly _endpointProvider: IEndpointProvider
 	) {
 		super();
 		this._register(this._chatMLFetcher.onDidMakeChatMLRequest(({ model, source, tokenCount }) => {
@@ -432,9 +448,57 @@ export class CopilotLanguageModelWrapper extends Disposable implements vscode.Ch
 	}
 
 	async provideLanguageModelResponse(messages: Array<vscode.LanguageModelChatMessage | vscode.LanguageModelChatMessage2>, options: vscode.LanguageModelChatRequestOptions, extensionId: string, progress: vscode.Progress<vscode.ChatResponseFragment2>, token: vscode.CancellationToken): Promise<any> {
+		let shouldShowModelInfo = false;
+		let actualModelUsed = '';
+
+		// Check if this is the Auto endpoint for special handling
+		if (this._endpoint.model === AutoChatEndpoint.id) {
+			shouldShowModelInfo = true;
+
+			// Extract the user prompt from the messages to determine which model will be selected
+			const lastMessage = messages[messages.length - 1];
+			let userPrompt = '';
+
+			if (lastMessage) {
+				// Extract text from the message content
+				for (const part of lastMessage.content) {
+					if (part instanceof vscode.LanguageModelTextPart) {
+						userPrompt += part.value;
+					}
+				}
+			}
+
+			// Get the actual endpoint that will be used by calling resolveAutoChatEndpoint
+			try {
+				const actualEndpoint = await resolveAutoChatEndpoint(
+					this._endpointProvider,
+					this._expService,
+					userPrompt
+				);
+				actualModelUsed = actualEndpoint.name || actualEndpoint.model;
+			} catch (error) {
+				console.warn('[AutoChatEndpoint] Failed to resolve actual endpoint:', error);
+				actualModelUsed = 'Auto';
+			}
+		} else {
+			// For all other models, show the model name
+			shouldShowModelInfo = true;
+			actualModelUsed = this._endpoint.name || this._endpoint.model;
+		}
+
+		let responseStarted = false;
 		const finishCallback: FinishedCallback = async (_text, index, delta): Promise<undefined> => {
 			if (delta.text) {
-				progress.report({ index, part: new vscode.LanguageModelTextPart(delta.text) });
+				let textToReport = delta.text;
+
+				// For any endpoint, prepend model info to the first text chunk
+				if (shouldShowModelInfo && !responseStarted && textToReport.trim()) {
+					responseStarted = true;
+					const modelInfo = `*[Using ${actualModelUsed}]*\n\n`;
+					textToReport = modelInfo + textToReport;
+				}
+
+				progress.report({ index, part: new vscode.LanguageModelTextPart(textToReport) });
 			}
 			if (delta.copilotToolCalls) {
 				for (const call of delta.copilotToolCalls) {
@@ -447,7 +511,6 @@ export class CopilotLanguageModelWrapper extends Disposable implements vscode.Ch
 					}
 				}
 			}
-			return undefined;
 		};
 		return this._provideLanguageModelResponse(messages, options, extensionId, finishCallback, token);
 	}
